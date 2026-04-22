@@ -936,11 +936,11 @@ function switchTab(name) {
       const duration = audioBuffer.duration; // segundos
 
       // Cada chunk: 20 minutos (fica bem abaixo de 25MB em WAV 16kHz mono)
-      const CHUNK_SEC = 20 * 60;
+      const CHUNK_SEC = 10 * 60;
       const totalChunks = Math.ceil(duration / CHUNK_SEC);
 
       tSetProgress(10, totalChunks > 1
-        ? `Dividindo em ${totalChunks} partes · ${Math.round(duration/60)} min de áudio...`
+        ? `Dividindo em ${totalChunks} partes · ${Math.round(duration/60)} min · processando...`
         : 'Preparando envio...');
 
       const transcripts = [];
