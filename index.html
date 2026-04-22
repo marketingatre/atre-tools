@@ -630,7 +630,7 @@ footer {
 <div class="panel-inner">
   <p class="tool-label">Ferramenta 01</p>
   <h2 class="tool-title">Transcritor <span>de Áudio</span></h2>
-  <p class="tool-sub">Transcrição via Whisper · MP3, MP4, M4A, WAV · até 25 MB</p>
+  <p class="tool-sub">Transcrição via Whisper · MP3, MP4, M4A, WAV · arquivos grandes comprimidos automaticamente</p>
 
   <p class="key-label">Chave OpenAI</p>
   <div class="key-row">
@@ -723,6 +723,7 @@ footer {
       <option value="192000" selected>192 kbps — padrão</option>
       <option value="128000">128 kbps — compacto</option>
       <option value="96000">96 kbps — menor arquivo</option>
+      <option value="64000">64 kbps mono — compressão máxima</option>
     </select>
   </div>
 
@@ -833,10 +834,10 @@ function switchTab(name) {
   function tLoadFile(f) {
     tShowError('');
     const ext = f.name.split('.').pop().toLowerCase();
-    if (!['mp3','mp4','m4a','wav','ogg','webm','aac','flac'].includes(ext)) { tShowError('Formato não suportado.'); return; }
-    if (f.size > 25 * 1024 * 1024) { tShowError('Arquivo maior que 25 MB.'); return; }
+    if (!['mp3','mp4','m4a','wav','ogg','webm','aac','flac','mpeg','mpg','mov','avi','mkv'].includes(ext)) { tShowError('Formato não suportado.'); return; }
     tFile = f;
-    document.getElementById('t-fileName').textContent = f.name;
+    const big = f.size > 25 * 1024 * 1024;
+    document.getElementById('t-fileName').textContent = f.name + (big ? ' · será comprimido automaticamente' : '');
     document.getElementById('t-fileSize').textContent = fmtSize(f.size);
     document.getElementById('t-fileCard').style.display = 'flex';
     document.getElementById('t-transcribeBtn').style.display = 'block';
@@ -850,6 +851,74 @@ function switchTab(name) {
     setTimeout(() => { document.getElementById('t-keyHint').textContent = 'A chave fica salva apenas no seu browser.'; }, 2000);
   };
 
+  // Decodifica o arquivo e retorna AudioBuffer completo
+  async function decodeAudio(file) {
+    const arrayBuffer = await file.arrayBuffer();
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    try { return await audioCtx.decodeAudioData(arrayBuffer); }
+    catch(e) { throw new Error('Não foi possível decodificar o arquivo de áudio.'); }
+  }
+
+  // Renderiza um trecho do AudioBuffer como WAV mono 16kHz
+  async function renderChunkToWav(audioBuffer, startSec, endSec) {
+    const sr = 16000;
+    const startSample = Math.floor(startSec * audioBuffer.sampleRate);
+    const endSample = Math.min(Math.floor(endSec * audioBuffer.sampleRate), audioBuffer.length);
+    const chunkLength = endSample - startSample;
+    const outSamples = Math.ceil(chunkLength * (sr / audioBuffer.sampleRate));
+
+    const offlineCtx = new OfflineAudioContext(1, outSamples, sr);
+    const source = offlineCtx.createBufferSource();
+
+    // Cria um buffer só com o trecho
+    const chunkBuf = new AudioContext().createBuffer(1, chunkLength, audioBuffer.sampleRate);
+    const srcData = audioBuffer.getChannelData(0);
+    const dstData = chunkBuf.getChannelData(0);
+    for (let i = 0; i < chunkLength; i++) dstData[i] = srcData[startSample + i];
+
+    source.buffer = chunkBuf;
+    source.connect(offlineCtx.destination);
+    source.start();
+    const rendered = await offlineCtx.startRendering();
+
+    const ns = rendered.length;
+    const dataSize = ns * 2;
+    const ab = new ArrayBuffer(44 + dataSize);
+    const v = new DataView(ab);
+    function ws(o,s){for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));}
+    ws(0,'RIFF'); v.setUint32(4,36+dataSize,true); ws(8,'WAVE'); ws(12,'fmt ');
+    v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
+    v.setUint32(24,sr,true); v.setUint32(28,sr*2,true);
+    v.setUint16(32,2,true); v.setUint16(34,16,true);
+    ws(36,'data'); v.setUint32(40,dataSize,true);
+    const ch = rendered.getChannelData(0);
+    let off = 44;
+    for(let i=0;i<ns;i++){
+      const s=Math.max(-1,Math.min(1,ch[i]));
+      v.setInt16(off,s<0?s*0x8000:s*0x7FFF,true); off+=2;
+    }
+    return new File([ab], 'chunk.wav', {type:'audio/wav'});
+  }
+
+  // Envia um File WAV para Whisper e retorna o texto
+  async function sendToWhisper(wavFile, apiKey) {
+    const formData = new FormData();
+    formData.append('file', wavFile, 'audio.wav');
+    formData.append('model', 'whisper-1');
+    formData.append('language', 'pt');
+    formData.append('response_format', 'text');
+    const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + apiKey },
+      body: formData
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err?.error?.message || 'Status ' + res.status);
+    }
+    return (await res.text()).trim();
+  }
+
   window.startTranscription = async function() {
     if (!tFile) return;
     const key = document.getElementById('t-apiKey').value.trim() || localStorage.getItem('oai_key') || '';
@@ -858,48 +927,49 @@ function switchTab(name) {
     tShowError('');
     document.getElementById('t-resultArea').style.display = 'none';
     document.getElementById('t-transcribeBtn').disabled = true;
-    document.getElementById('t-transcribeBtn').textContent = 'Enviando...';
+    document.getElementById('t-transcribeBtn').textContent = 'Processando...';
     document.getElementById('t-progressWrap').style.display = 'block';
-    tSetProgress(20, 'Enviando para a API Whisper...');
-
-    const formData = new FormData();
-    // Fix double extensions
-    let fixedName = tFile.name;
-    const parts = fixedName.split('.');
-    const validExts = ['flac','m4a','mp3','mp4','mpeg','mpga','oga','ogg','wav','webm'];
-    if (parts.length > 2 && validExts.includes(parts[parts.length-2].toLowerCase()) && validExts.includes(parts[parts.length-1].toLowerCase())) {
-      fixedName = parts.slice(0, -1).join('.');
-    }
-    if (!validExts.includes(fixedName.split('.').pop().toLowerCase())) fixedName += '.mp3';
-
-    formData.append('file', tFile, fixedName);
-    formData.append('model', 'whisper-1');
-    formData.append('language', 'pt');
-    formData.append('response_format', 'text');
-
-    let pct = 20;
-    const ticker = setInterval(() => { pct = Math.min(85, pct + 2); document.getElementById('t-progressFill').style.width = pct + '%'; }, 600);
+    tSetProgress(5, 'Decodificando áudio...');
 
     try {
-      const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-        method: 'POST',
-        headers: { 'Authorization': 'Bearer ' + key },
-        body: formData
-      });
-      clearInterval(ticker);
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        tShowError('Erro da API: ' + (err?.error?.message || 'Status ' + res.status));
-      } else {
-        const text = await res.text();
-        tSetProgress(100, 'Concluído!');
-        document.getElementById('t-output').value = text.trim();
-        document.getElementById('t-resultArea').style.display = 'block';
+      const audioBuffer = await decodeAudio(tFile);
+      const duration = audioBuffer.duration; // segundos
+
+      // Cada chunk: 20 minutos (fica bem abaixo de 25MB em WAV 16kHz mono)
+      const CHUNK_SEC = 20 * 60;
+      const totalChunks = Math.ceil(duration / CHUNK_SEC);
+
+      tSetProgress(10, totalChunks > 1
+        ? `Dividindo em ${totalChunks} partes · ${Math.round(duration/60)} min de áudio...`
+        : 'Preparando envio...');
+
+      const transcripts = [];
+
+      for (let i = 0; i < totalChunks; i++) {
+        const startSec = i * CHUNK_SEC;
+        const endSec = Math.min((i + 1) * CHUNK_SEC, duration);
+        const pct = 10 + Math.round(((i) / totalChunks) * 85);
+
+        tSetProgress(pct, totalChunks > 1
+          ? `Transcrevendo parte ${i + 1} de ${totalChunks}...`
+          : 'Enviando para Whisper...');
+
+        const wavChunk = await renderChunkToWav(audioBuffer, startSec, endSec);
+        const text = await sendToWhisper(wavChunk, key);
+        transcripts.push(text);
+
+        tSetProgress(10 + Math.round(((i + 1) / totalChunks) * 85),
+          totalChunks > 1 ? `Parte ${i + 1} de ${totalChunks} concluída` : 'Finalizando...');
       }
+
+      tSetProgress(100, 'Concluído!');
+      document.getElementById('t-output').value = transcripts.join(' ').trim();
+      document.getElementById('t-resultArea').style.display = 'block';
+
     } catch(err) {
-      clearInterval(ticker);
-      tShowError('Erro de rede: ' + err.message);
+      tShowError('Erro: ' + err.message);
     }
+
     document.getElementById('t-transcribeBtn').disabled = false;
     document.getElementById('t-transcribeBtn').textContent = 'Transcrever';
   };
